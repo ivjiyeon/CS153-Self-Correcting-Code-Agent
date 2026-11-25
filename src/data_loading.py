@@ -1,113 +1,115 @@
-"""Load MBPP+ and split every problem's tests into VISIBLE tests (shown to the
-model and used for execution feedback) and HIDDEN tests (used only for final
-evaluation, never shown to the model)."""
-import ast
+"""Load the prepared MBPP+ splits from disk (created by prepare_data.py).
+
+Folder layout:
+  data/raw/        exact get_mbpp_plus() output (pickle) + manifest
+  data/processed/  dev split (90%): model-facing problem text + visible cases
+  data/private/    hidden cases for every problem, the held-out eval split (10%),
+                   canonical solutions and the split manifest
+Test cases are stored as pickles of real Python objects (tuples, dicts, complex
+numbers survive exactly), so no JSON deserialization is needed."""
+import argparse
+import json
+import os
+import pickle
 import random
-import re
 from dataclasses import dataclass
-from typing import List
+from typing import Any, Dict, List, Tuple
+
+DEFAULT_DATA_DIRECTORY = "data"
+SPLIT_NAMES = ["dev", "eval"]
 
 
 @dataclass
 class CodingProblem:
     """One MBPP+ problem with its visible / hidden test split."""
-    task_id: int
-    description: str              # natural-language task statement
-    function_name: str            # name the model must implement
-    visible_tests: List[str]      # assert statements shown to the model
-    hidden_test_script: str       # standalone script; exit code 0 == all hidden tests pass
-    reference_solution: str       # ground-truth code (used only for sanity checks)
+    task_id: str                                   # e.g. "Mbpp/100"
+    description: str                               # natural-language task statement
+    function_name: str                             # entry point the model must implement
+    absolute_tolerance: float                      # float tolerance for output comparison
+    visible_tests: List[str]                       # assert texts shown to the model
+    visible_cases: List[Tuple[list, Any]]          # (arguments, expected) behind visible_tests
+    hidden_cases: List[Tuple[list, Any]]           # unseen cases (rest of base + plus inputs)
+    reference_solution: str                        # canonical code, sanity checks only
+
+    @property
+    def task_number(self) -> int:
+        """Numeric part of the task id (used to seed sampling). Output: int."""
+        return int(self.task_id.split("/")[-1])
 
 
-def clean_task_description(raw_prompt: str) -> str:
-    """Strip quotes and example asserts from the raw MBPP+ prompt.
+def get_split_paths(data_directory: str, split_name: str) -> Dict[str, str]:
+    """Locate the files of one split.
 
-    Input:  raw_prompt (str) - the 'prompt' field of an MBPP+ record.
-    Output: str - the plain task description without test lines.
+    Input:  data_directory (str), split_name (str) - 'dev' or 'eval'.
+    Output: dict with keys problems, visible_cases, hidden_cases (file paths).
+            The dev split's model-facing files are in processed/, the eval split
+            lives entirely in private/. Hidden cases are always in private/.
     """
-    description_lines = []
-    for line in raw_prompt.replace('"""', "").strip().splitlines():
-        if line.strip().startswith("assert"):
-            continue
-        description_lines.append(line)
-    return "\n".join(description_lines).strip()
+    if split_name not in SPLIT_NAMES:
+        raise ValueError(f"split_name must be one of {SPLIT_NAMES}")
+    model_facing_folder = "processed" if split_name == "dev" else "private"
+    return {
+        "problems": os.path.join(data_directory, model_facing_folder, f"{split_name}_problems.jsonl"),
+        "visible_cases": os.path.join(data_directory, model_facing_folder, f"{split_name}_visible_cases.pkl"),
+        "hidden_cases": os.path.join(data_directory, "private", f"{split_name}_hidden_cases.pkl"),
+    }
 
 
-def extract_function_name(reference_solution: str, example_assertion: str) -> str:
-    """Find the name of the function under test.
+def load_problems(split_name: str, num_problems: int, seed: int, shard_index: int = 0,
+                  num_shards: int = 1, data_directory: str = DEFAULT_DATA_DIRECTORY) -> List[CodingProblem]:
+    """Load a split, sample reproducibly, and return this shard's slice.
 
-    Input:  reference_solution (str) - ground-truth code,
-            example_assertion (str)  - one assert statement calling the function.
-    Output: str - the function name that appears both as a `def` and in the assert
-            (falls back to the first called name in the assert).
-    """
-    defined_function_names = re.findall(r"^def\s+(\w+)\s*\(", reference_solution, re.MULTILINE)
-    called_function_names = [
-        node.func.id
-        for node in ast.walk(ast.parse(example_assertion.strip()))
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    ]
-    for called_name in called_function_names:
-        if called_name in defined_function_names:
-            return called_name
-    return called_function_names[0] if called_function_names else defined_function_names[-1]
-
-
-def build_problem(record: dict, num_visible_tests: int) -> CodingProblem:
-    """Convert one raw dataset record to a CodingProblem.
-
-    Input:  record (dict) - one row of `evalplus/mbppplus`,
-            num_visible_tests (int) - how many asserts to reveal to the model.
-    Output: CodingProblem.
-    """
-    all_base_tests = list(record["test_list"])
-    visible_tests = all_base_tests[:num_visible_tests]
-    leftover_base_tests = all_base_tests[num_visible_tests:]
-
-    # Hidden evaluation = leftover base asserts + the extended MBPP+ test script.
-    imports_block = "\n".join(record.get("test_imports", []) or [])
-    hidden_test_script = "\n".join(
-        [imports_block, record.get("test", "") or "", "\n".join(leftover_base_tests)]
-    )
-    return CodingProblem(
-        task_id=int(record["task_id"]),
-        description=clean_task_description(record["prompt"]),
-        function_name=extract_function_name(record["code"], visible_tests[0]),
-        visible_tests=visible_tests,
-        hidden_test_script=hidden_test_script,
-        reference_solution=record["code"],
-    )
-
-
-def load_problems(num_problems: int, num_visible_tests: int, seed: int,
-                  shard_index: int = 0, num_shards: int = 1) -> List[CodingProblem]:
-    """Sample problems reproducibly and return this shard's slice.
-
-    Input:  num_problems (int)      - total problems to sample (e.g. 200),
-            num_visible_tests (int) - visible tests per problem (e.g. 3),
-            seed (int)              - sampling seed,
-            shard_index / num_shards (int) - split work across SLURM array tasks.
+    Input:  split_name (str) - 'dev' or 'eval', num_problems (int) - max problems to
+            use (<= split size), seed (int), shard_index / num_shards (int) - SLURM
+            array sharding, data_directory (str).
     Output: List[CodingProblem] for this shard.
     """
-    from datasets import load_dataset
+    paths = get_split_paths(data_directory, split_name)
+    with open(paths["problems"]) as problems_file:
+        problem_records = [json.loads(line) for line in problems_file]
+    with open(paths["visible_cases"], "rb") as visible_file:
+        visible_cases_by_task = pickle.load(visible_file)
+    with open(paths["hidden_cases"], "rb") as hidden_file:
+        hidden_cases_by_task = pickle.load(hidden_file)
+    with open(os.path.join(data_directory, "private", "canonical_solutions.pkl"), "rb") as solutions_file:
+        canonical_solutions = pickle.load(solutions_file)
 
-    dataset = load_dataset("evalplus/mbppplus", split="test")
-    all_records = [dataset[row_index] for row_index in range(len(dataset))]
-    random.Random(seed).shuffle(all_records)
-    selected_records = all_records[:num_problems]
-    shard_records = selected_records[shard_index::num_shards]
-    return [build_problem(record, num_visible_tests) for record in shard_records]
+    random.Random(seed).shuffle(problem_records)
+    selected_records = problem_records[:num_problems][shard_index::num_shards]
+    return [CodingProblem(
+        task_id=record["task_id"], description=record["description"],
+        function_name=record["function_name"], absolute_tolerance=record["absolute_tolerance"],
+        visible_tests=record["visible_tests"],
+        visible_cases=visible_cases_by_task[record["task_id"]],
+        hidden_cases=hidden_cases_by_task[record["task_id"]],
+        reference_solution=canonical_solutions[record["task_id"]]) for record in selected_records]
 
 
 if __name__ == "__main__":
-    # Sanity check: the reference solution must pass both visible and hidden tests.
-    from src.sandbox import evaluate_hidden_tests, evaluate_visible_tests
+    # Sanity check: canonical solutions must pass everything, a stub must fail hidden cases.
+    from src.sandbox import evaluate_cases
 
-    for sample_problem in load_problems(num_problems=5, num_visible_tests=3, seed=0):
-        visible_report = evaluate_visible_tests(sample_problem.reference_solution,
-                                                sample_problem.visible_tests)
-        hidden_passed = evaluate_hidden_tests(sample_problem.reference_solution,
-                                              sample_problem.hidden_test_script)
-        print(f"task {sample_problem.task_id} ({sample_problem.function_name}): "
-              f"visible {visible_report.passed_count}/{visible_report.total_count}, "
-              f"hidden_passed={hidden_passed}")
+    argument_parser = argparse.ArgumentParser()
+    argument_parser.add_argument("--split", default="dev", choices=SPLIT_NAMES)
+    argument_parser.add_argument("--limit", type=int, default=10_000)
+    argument_parser.add_argument("--data_directory", default=DEFAULT_DATA_DIRECTORY)
+    parsed_arguments = argument_parser.parse_args()
+
+    problems = load_problems(parsed_arguments.split, parsed_arguments.limit, seed=0,
+                             data_directory=parsed_arguments.data_directory)
+    failures = 0
+    for problem in problems:
+        visible_report = evaluate_cases(problem.reference_solution, problem.function_name,
+                                        problem.visible_cases, problem.absolute_tolerance)
+        hidden_report = evaluate_cases(problem.reference_solution, problem.function_name,
+                                       problem.hidden_cases, problem.absolute_tolerance)
+        stub_code = f"def {problem.function_name}(*arguments, **keyword_arguments):\n    return None\n"
+        stub_report = evaluate_cases(stub_code, problem.function_name, problem.hidden_cases,
+                                     problem.absolute_tolerance)
+        reference_ok = visible_report.all_passed and hidden_report.all_passed
+        stub_correctly_fails = not stub_report.all_passed
+        if not (reference_ok and stub_correctly_fails):
+            failures += 1
+            print(f"PROBLEM {problem.task_id}: reference_ok={reference_ok} "
+                  f"stub_fails={stub_correctly_fails}")
+    print(f"Checked {len(problems)} problems in split '{parsed_arguments.split}': {failures} with issues.")
