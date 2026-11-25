@@ -1,4 +1,6 @@
 *.DS_Store
 *experiments4.ipynb
+*__pycache__
+.gitignore
 
 /data/

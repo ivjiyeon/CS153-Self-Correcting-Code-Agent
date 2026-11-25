@@ -30,6 +30,7 @@ def as_list(possibly_missing_inputs: Any) -> list:
     Input:  possibly_missing_inputs (Any) - e.g. task Mbpp/793 stores `{}` instead of a list.
     Output: list.
     """
+    # Some EvalPlus records contain placeholders instead of a list.
     return possibly_missing_inputs if isinstance(possibly_missing_inputs, list) else []
 
 
@@ -39,6 +40,7 @@ def clean_task_description(raw_prompt: str) -> str:
     Input:  raw_prompt (str) - the 'prompt' field of an MBPP+ problem.
     Output: str - plain task description without test lines.
     """
+    # Remove triple quotes and assert statements so the model receives only the task text.
     description_lines = [line for line in raw_prompt.replace('"""', "").strip().splitlines()
                          if not line.strip().startswith("assert")]
     return "\n".join(description_lines).strip()
@@ -51,6 +53,7 @@ def value_round_trips(value: Any) -> bool:
     Output: bool - True if the assert text shown to the model faithfully shows the value.
     """
     try:
+        # Re-evaluate repr(value) to ensure rendered test values can be read back safely.
         restored_value = eval(repr(value), {"inf": float("inf"), "nan": float("nan")})
     except Exception:
         return False
@@ -74,14 +77,17 @@ def prepare_task(record: dict, num_visible_tests: int, per_case_timeout_seconds:
     """
     base_inputs = as_list(record["base_input"])
     plus_inputs = as_list(record["plus_input"])
+    # The original base inputs supply the visible tests, so enough must exist before splitting.
     if len(base_inputs) < num_visible_tests:
         return None, "too_few_base_inputs"
 
     all_inputs = base_inputs + plus_inputs
+    # Execute each canonical solution once so visible and hidden outputs come from the same source.
     canonical_results = compute_expected_outputs(record["canonical_solution"], record["entry_point"],
                                                  all_inputs, per_case_timeout_seconds)
     visible_results = canonical_results[:num_visible_tests]
     if not all(succeeded for succeeded, _ in visible_results):
+        print(visible_results)
         return None, "canonical_failed_on_visible_input"
 
     visible_cases = [(all_inputs[position], visible_results[position][1]) for position in range(num_visible_tests)]
@@ -96,10 +102,12 @@ def prepare_task(record: dict, num_visible_tests: int, per_case_timeout_seconds:
     visible_signatures = {repr(argument_list) for argument_list, _ in visible_cases}
     hidden_cases = []
     num_oversized_cases = 0
+    # Only inputs after the visible prefix are candidates for hidden testing.
     for position in range(num_visible_tests, len(all_inputs)):
         succeeded, expected_output = canonical_results[position]
         if not succeeded or repr(all_inputs[position]) in visible_signatures:
             continue
+        # Skip unusually large cases that could exceed sandbox or serialization limits.
         case_size_in_bytes = len(pickle.dumps((all_inputs[position], expected_output)))
         if case_size_in_bytes > max_case_bytes:
             num_oversized_cases += 1
@@ -119,6 +127,7 @@ def prepare_task(record: dict, num_visible_tests: int, per_case_timeout_seconds:
 
 def write_pickle(path: str, python_object: Any) -> None:
     """Save an object with pickle (exact types). Input: path (str), python_object. Output: None."""
+    # Create the split-specific parent directory before writing.
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as output_file:
         pickle.dump(python_object, output_file)
@@ -126,6 +135,7 @@ def write_pickle(path: str, python_object: Any) -> None:
 
 def write_jsonl(path: str, records: List[dict]) -> None:
     """Save plain-text records, one JSON object per line. Input: path (str), records. Output: None."""
+    # JSONL lets consumers load one problem record at a time.
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as output_file:
         for record in records:
@@ -146,6 +156,7 @@ def main() -> None:
     arguments = parser.parse_args()
     data_directory = arguments.data_directory
 
+    # Keep an exact copy of EvalPlus output before filtering or splitting tasks.
     raw_problems: Dict[str, dict] = get_mbpp_plus()
     write_pickle(os.path.join(data_directory, "raw", "mbpp_plus_raw.pkl"), raw_problems)
     with open(os.path.join(data_directory, "raw", "raw_manifest.json"), "w") as manifest_file:
@@ -167,6 +178,7 @@ def main() -> None:
             print(f"prepared {position + 1}/{len(raw_problems)}", flush=True)
 
     kept_task_ids = sorted(prepared_by_task)
+    # Shuffle in a reproducible order, then place the leading tasks in the eval split.
     random.Random(arguments.seed).shuffle(kept_task_ids)
     num_eval_tasks = max(1, round(arguments.eval_fraction * len(kept_task_ids)))
     split_task_ids = {"eval": sorted(kept_task_ids[:num_eval_tasks]), "dev": sorted(kept_task_ids[num_eval_tasks:])}
